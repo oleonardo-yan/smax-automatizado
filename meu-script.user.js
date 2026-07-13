@@ -10,6 +10,8 @@
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js
 // @grant        none
 // @run-at       document-idle
+// @downloadURL  https://raw.githubusercontent.com/oleonardo-yan/smax-automatizado/main/meu-script.user.js
+// @updateURL    https://raw.githubusercontent.com/oleonardo-yan/smax-automatizado/main/meu-script.user.js
 // ==/UserScript==
 
 (function () {
