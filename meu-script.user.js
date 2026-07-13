@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         TJSP Suporte - Robo de Automacoes + Visualizador de Anexos
+// @name         SMAX AUTOMATIZADO - SGS 2.2.1
 // @namespace    http://tampermonkey.net/
 // @version      1.9.1
 // @description  Robo de opcoes automatizadas para o suporte TJSP, com visualizador de anexos (PDF, imagens, DOCX) integrado direto na tela, sem downloads, navegacao entre anexos e painel de dados da solicitacao.
