@@ -1,15 +1,24 @@
 // ==UserScript==
-// @name         TJSP Suporte - Robo de Automacoes
+// @name         TJSP Suporte - Robo de Automacoes + Visualizador de Anexos
 // @namespace    http://tampermonkey.net/
-// @version      1.8.15
-// @description  Robo de opcoes automatizadas para o suporte TJSP
+// @version      1.9.1
+// @description  Robo de opcoes automatizadas para o suporte TJSP, com visualizador de anexos (PDF, imagens, DOCX) integrado direto na tela, sem downloads, navegacao entre anexos e painel de dados da solicitacao.
 // @author       Leonardo
 // @match        https://suporte.tjsp.jus.br/*
+// @require      https://unpkg.com/mammoth@1.6.0/mammoth.browser.min.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js
 // @grant        none
+// @run-at       document-idle
 // ==/UserScript==
 
 (function () {
     "use strict";
+
+    // Desativado temporariamente para revisao futura (icone do robo / "Informar
+    // recebimento do chamado"). Trocar para true reativa sem precisar mexer em
+    // mais nada.
+    var ROBO_OPCOES_HABILITADO = false;
 
     var STORAGE_ETAPA = "tjsp_auto_etapa_recebimento";
     var STORAGE_PRIMEIRO_NOME = "tjsp_auto_primeiro_nome_solicitante";
@@ -227,6 +236,36 @@
         }
     }
 
+    function ocultarLegendaVaziaImagem(img) {
+        var figure, legenda, textoLegenda;
+        if (!img) { return; }
+        figure = img.closest("figure.image, figure.cke_widget_wrapper, figure");
+        if (!figure) { return; }
+        legenda = figure.querySelector("figcaption");
+        if (!legenda) { return; }
+        textoLegenda = (legenda.textContent || "").replace(/ /g, " ").trim();
+        if (!textoLegenda) { legenda.style.setProperty("display", "none", "important"); }
+        else { legenda.style.removeProperty("display"); }
+    }
+
+    function observarArtefatosImagem(img) {
+        var wrapper, observer;
+        if (!img || img.getAttribute("data-tjsp-artefatos-observados")) { return; }
+        wrapper = img.closest(".cke_widget_wrapper") || img.parentNode;
+        if (!wrapper) { return; }
+        img.setAttribute("data-tjsp-artefatos-observados", "1");
+        // O CKEditor recria/reexibe o "puxador" de redimensionar e a legenda vazia
+        // do widget de imagem toda vez que a imagem e selecionada/focada de novo
+        // (sao elementos novos, nao os mesmos que ja ocultamos uma vez no clique
+        // do botao "Formatar resposta") — por isso precisamos reagir a cada
+        // mudanca no wrapper, e nao so ocultar uma unica vez.
+        observer = new MutationObserver(function () {
+            ocultarMarcadoresResizeImagem(img);
+            ocultarLegendaVaziaImagem(img);
+        });
+        observer.observe(wrapper, { childList: true, subtree: true, attributes: true, attributeFilter: ["style", "class"] });
+    }
+
     function aplicarBordaImagem(img) {
         if (!img) { return; }
         img.classList.add("tjsp-auto-imagem-formatada");
@@ -234,6 +273,8 @@
         img.style.padding = "0"; img.style.marginTop = "10px"; img.style.marginBottom = "10px";
         img.style.outline = "none"; img.style.boxShadow = "none";
         ocultarMarcadoresResizeImagem(img);
+        ocultarLegendaVaziaImagem(img);
+        observarArtefatosImagem(img);
     }
 
     function formatarImagensNoEditor(editor, exibirAlerta) {
@@ -359,16 +400,26 @@
         barra = localizarBarraDoEditor(editor); if (!barra) { return; }
         if (editor.getAttribute("data-tjsp-toolbar-id")) { return; }
         contadorToolbar += 1; id = "tjsp-editor-toolbar-" + contadorToolbar;
-        editor.setAttribute("data-tjsp-toolbar-id", id);
+        // Monta o grupo de botoes ANTES de marcar o editor como "ja instalado" —
+        // se algo aqui lancar excecao, o atributo nao fica setado, e a proxima
+        // tentativa (MutationObserver ou intervalo de seguranca) pode tentar de novo
+        // em vez de considerar (erroneamente) que ja foi instalado pra sempre.
         grupo = document.createElement("span"); grupo.id = id; grupo.className = "tjsp-editor-toolbar-group";
         grupo.appendChild(criarBotaoToolbar(criarSvgCaneta(), "Assinar resposta", "tjsp-editor-btn-assinar", function () { inserirAssinaturaNoEditor(editor); }));
         grupo.appendChild(criarBotaoToolbar(criarSvgImagem(), "Formatar resposta", "tjsp-editor-btn-imagens", function () { formatarConteudoNoEditor(editor); }));
         barra.appendChild(grupo);
+        editor.setAttribute("data-tjsp-toolbar-id", id);
     }
 
     function instalarBotoesEditores() {
         var editores = document.querySelectorAll("[contenteditable='true'].cke_wysiwyg_div, [contenteditable='true'][role='textbox'], .cke_wysiwyg_div[contenteditable='true']"), i;
-        for (i = 0; i < editores.length; i++) { instalarBotoesNoEditor(editores[i]); }
+        for (i = 0; i < editores.length; i++) {
+            // Try/catch por editor: um erro ao instalar num editor (ex.: Descricao)
+            // nao pode impedir a tentativa nos editores seguintes na mesma lista
+            // (ex.: o editor da aba Discussoes, que normalmente vem depois na ordem).
+            try { instalarBotoesNoEditor(editores[i]); }
+            catch (e) { console.error("[TJSP] Erro ao instalar botoes no editor " + i + " (aria-label=" + editores[i].getAttribute("aria-label") + "):", e); }
+        }
     }
 
     function deveMostrarPesquisaChamado() { return /^\/saw\//i.test(location.pathname); }
@@ -591,6 +642,7 @@
 
     function criarBotao() {
         var widgetExistente, botaoAntigo, wrapperAntigo, widget, botaoRobo, menu, cabecalho;
+        if (!ROBO_OPCOES_HABILITADO) { widgetExistente = document.getElementById("tjsp-auto-robot-widget"); if (widgetExistente) { widgetExistente.remove(); } return; }
         if (!estaEmTelaDeChamado()) { widgetExistente = document.getElementById("tjsp-auto-robot-widget"); if (widgetExistente) { widgetExistente.remove(); } return; }
         if (document.getElementById("tjsp-auto-robot-widget")) { return; }
         botaoAntigo = document.getElementById("btn-tjsp-informar-recebimento"); if (botaoAntigo) { wrapperAntigo = botaoAntigo.closest("#wrapper-tjsp-informar-recebimento") || botaoAntigo; wrapperAntigo.remove(); }
@@ -604,14 +656,1485 @@
         widget.appendChild(botaoRobo); widget.appendChild(menu); document.body.appendChild(widget);
     }
 
+    function executarProtegido(fn, rotulo) {
+        try { fn(); } catch (e) { console.error("[TJSP] Erro em " + rotulo + ":", e); }
+    }
+
+    function executarCicloAtualizacao() {
+        executarProtegido(criarBotao, "criarBotao");
+        executarProtegido(criarPesquisaChamado, "criarPesquisaChamado");
+        executarProtegido(instalarBotoesEditores, "instalarBotoesEditores");
+        executarProtegido(continuarFluxoPendente, "continuarFluxoPendente");
+        executarProtegido(destacarGuiaAbertaPelaPesquisa, "destacarGuiaAbertaPelaPesquisa");
+    }
+
     function iniciar() {
         var observer;
-        criarEstilo(); criarBotao(); criarPesquisaChamado(); instalarBotoesEditores(); destacarGuiaAbertaPelaPesquisa();
-        observer = new MutationObserver(function () { criarBotao(); criarPesquisaChamado(); instalarBotoesEditores(); continuarFluxoPendente(); destacarGuiaAbertaPelaPesquisa(); });
+        criarEstilo();
+        executarCicloAtualizacao();
+        observer = new MutationObserver(executarCicloAtualizacao);
         observer.observe(document.body, { childList: true, subtree: true });
-        continuarFluxoPendente();
-        console.log("[TJSP] Robo de automacoes carregado. Versao 1.8.15.");
+        // Rede de seguranca: caso alguma janela de mutacoes seja perdida (ex.: outro
+        // script no mesmo site provocando recriacoes de DOM fora do lote observado),
+        // este intervalo garante que os botoes do editor sejam reinstalados mesmo assim.
+        // instalarBotoesEditores() e idempotente (nao duplica se ja instalado).
+        window.setInterval(function () { executarProtegido(instalarBotoesEditores, "instalarBotoesEditores (intervalo)"); }, 1500);
+        // Ganchos de depuracao temporarios — permitem testar manualmente pelo Console
+        // (window.__tjspInstalarBotoesEditores() / window.__tjspContarGrupos()) sem
+        // precisar esperar o ciclo automatico, pra isolar se o problema e a instalacao
+        // em si ou o agendamento das tentativas. Podem ser removidos depois de resolvido.
+        window.__tjspInstalarBotoesEditores = instalarBotoesEditores;
+        window.__tjspContarGrupos = function () { return document.querySelectorAll(".tjsp-editor-toolbar-group").length; };
+        console.log("[TJSP] Robo de automacoes carregado. Versao 1.9.1.");
     }
 
     if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", iniciar); } else { iniciar(); }
 }());
+
+// ============================================================
+// MODULO: SMAX - Visualizador de Anexos (integrado a partir da v0.20)
+// Mantido em IIFE proprio (escopo isolado) para nao colidir com nomes
+// do modulo do Robo de Automacoes acima.
+// ============================================================
+(function () {
+    'use strict';
+
+    // ============================================================
+    // CONFIGURAÇÕES
+    // ============================================================
+    const DEBUG = true;
+    const LOG_PREFIX = '[SMAX-Preview]';
+    const REGEX_TELA_CHAMADO = /\/saw\/Request\/\d+\//;
+    const SELETOR_ANEXO = 'a[ng-href*="/frs/file-list/"], a[href*="/frs/file-list/"]';
+    const COR_AZUL = '#1a73c7';          // azul vivo, igual ao da barra superior/"Consulta rápida" do SMAX
+    const COR_AZUL_ESCURO = '#12558f';
+    const COR_ACCENT = '#5aa9e6';        // azul mais claro, para hovers/destaques (mesma família, sem laranja/vermelho)
+    const PDFJS_WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    const REGEX_PROCESSO = /\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}/; // padrão CNJ — ajustar se o formato real for diferente
+
+    function log(...args) {
+        if (DEBUG) console.log(LOG_PREFIX, ...args);
+    }
+
+    // Configura o worker do PDF.js (se biblioteca estiver carregada)
+    if (typeof pdfjsLib !== 'undefined') {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
+        log('PDF.js carregado. Versão:', pdfjsLib.version);
+    } else {
+        log('⚠️ PDF.js não carregou. PDFs cairão em fallback (iframe/nova guia).');
+    }
+
+    // ============================================================
+    // ESTILOS DO MODAL
+    // ============================================================
+    function injetarEstilos() {
+        if (document.getElementById('smax-preview-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'smax-preview-styles';
+        style.textContent = `
+            #smax-preview-overlay {
+                position: fixed;
+                top: 0; left: 0; right: 0; bottom: 0;
+                background: rgba(8, 14, 22, 0.88);
+                z-index: 999999;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                animation: smaxFadeIn 0.2s ease-out;
+                font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+            }
+            @keyframes smaxFadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+            /* Envelope que agrupa o modal + setas — as setas ficam ancoradas
+               nas bordas do modal em vez de flutuar soltas na tela */
+            #smax-preview-shell {
+                position: relative;
+                width: 92vw;
+                height: 94vh;
+                max-width: 1500px;
+            }
+            #smax-preview-modal {
+                background: #fff;
+                border-radius: 10px;
+                width: 100%;
+                height: 100%;
+                display: flex;
+                flex-direction: column;
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255,255,255,0.06);
+                overflow: hidden;
+            }
+            #smax-preview-header {
+                background: linear-gradient(180deg, ${COR_AZUL} 0%, ${COR_AZUL_ESCURO} 100%);
+                border-bottom: 3px solid ${COR_ACCENT};
+                color: #fff;
+                padding: 11px 16px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                flex-shrink: 0;
+            }
+            #smax-preview-title {
+                flex: 1;
+                font-weight: 600;
+                font-size: 15px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                letter-spacing: 0.2px;
+            }
+            #smax-preview-contador {
+                font-size: 12px;
+                font-weight: 700;
+                color: ${COR_AZUL_ESCURO};
+                background: #fff;
+                padding: 3px 12px;
+                border-radius: 999px;
+                white-space: nowrap;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+            }
+            .smax-preview-btn {
+                background: rgba(255, 255, 255, 0.12);
+                color: #fff;
+                border: 1px solid rgba(255, 255, 255, 0.35);
+                padding: 6px 13px;
+                border-radius: 5px;
+                cursor: pointer;
+                font-size: 13px;
+                font-family: inherit;
+                transition: background 0.15s, border-color 0.15s;
+            }
+            .smax-preview-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.28); border-color: rgba(255,255,255,0.6); }
+            .smax-preview-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+            .smax-preview-btn-close {
+                background: rgba(198, 40, 40, 0.85);
+                border-color: rgba(255,255,255,0.25);
+                font-weight: 600;
+                padding: 6px 14px;
+            }
+            .smax-preview-btn-close:hover { background: #c62828; border-color: rgba(255,255,255,0.4); }
+
+            /* Setas de navegação entre anexos — ancoradas nas bordas do modal.
+               Fundo azul sólido + anel branco pra ficarem bem visíveis sobre o overlay escuro. */
+            .smax-nav-arrow {
+                position: absolute;
+                top: 50%;
+                transform: translateY(-50%);
+                background: ${COR_AZUL};
+                color: #fff;
+                border: 3px solid #fff;
+                width: 46px;
+                height: 46px;
+                border-radius: 50%;
+                font-size: 24px;
+                line-height: 1;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: background 0.15s, transform 0.15s;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+                z-index: 1000000;
+            }
+            .smax-nav-arrow:hover:not(:disabled) { background: ${COR_AZUL_ESCURO}; transform: translateY(-50%) scale(1.08); }
+            .smax-nav-arrow:disabled { opacity: 0.35; cursor: not-allowed; }
+            .smax-nav-arrow.smax-nav-hidden { display: none; }
+            .smax-nav-prev { left: -22px; }
+            .smax-nav-next { right: -22px; }
+
+            /* Barra de controles do PDF */
+            #smax-pdf-toolbar {
+                background: ${COR_AZUL_ESCURO};
+                color: #fff;
+                padding: 7px 12px;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 13px;
+                flex-shrink: 0;
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+            }
+            #smax-pdf-toolbar button {
+                background: rgba(255,255,255,0.1);
+                color: #fff;
+                border: 1px solid rgba(255,255,255,0.25);
+                padding: 4px 10px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 13px;
+                transition: background 0.15s, border-color 0.15s;
+            }
+            #smax-pdf-toolbar button:hover:not(:disabled) { background: rgba(245, 166, 35, 0.25); border-color: ${COR_ACCENT}; }
+            #smax-pdf-toolbar button:disabled { opacity: 0.4; cursor: not-allowed; }
+            #smax-pdf-toolbar .smax-sep { flex: 1; }
+            #smax-pdf-toolbar input[type="number"] {
+                width: 55px;
+                padding: 3px 6px;
+                border: 1px solid rgba(255,255,255,0.3);
+                border-radius: 4px;
+                background: rgba(255,255,255,0.95);
+                color: #000;
+                font-size: 13px;
+                text-align: center;
+            }
+            #smax-pdf-toolbar input[type="number"]:focus {
+                outline: none;
+                border-color: ${COR_ACCENT};
+                box-shadow: 0 0 0 2px rgba(245, 166, 35, 0.3);
+            }
+
+            #smax-preview-body {
+                flex: 1;
+                overflow: auto;
+                background: #4a5765;
+                display: flex;
+                align-items: flex-start;
+                justify-content: center;
+                position: relative;
+                padding: 15px 0;
+            }
+            #smax-preview-body.smax-center-content {
+                align-items: center;
+            }
+            #smax-preview-body iframe {
+                width: 100%;
+                height: 100%;
+                border: none;
+                background: #fff;
+            }
+            #smax-preview-body img,
+            #smax-preview-body canvas.smax-img-canvas {
+                max-width: 100%;
+                max-height: 100%;
+                object-fit: contain;
+                display: block;
+                background: #fff;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            }
+            #smax-pdf-container {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 12px;
+                padding: 0 15px;
+            }
+            #smax-pdf-container canvas {
+                background: #fff;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+                max-width: 100%;
+                height: auto;
+            }
+            .smax-docx-wrap {
+                max-width: 900px;
+                width: 100%;
+                margin: 0 auto;
+            }
+            .smax-docx-aviso {
+                background: #eaf4fd;
+                border: 1px solid #b8dcf5;
+                color: #0c4a7a;
+                font-size: 12.5px;
+                padding: 8px 14px;
+                border-radius: 6px 6px 0 0;
+                margin: 0;
+            }
+            .smax-docx-content {
+                background: #fff;
+                padding: 40px 60px;
+                width: 100%;
+                box-sizing: border-box;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+                font-family: 'Calibri', 'Segoe UI', sans-serif;
+                line-height: 1.6;
+                color: #222;
+            }
+            .smax-docx-wrap .smax-docx-content { border-radius: 0 0 4px 4px; }
+            .smax-docx-content h1, .smax-docx-content h2, .smax-docx-content h3 {
+                color: ${COR_AZUL_ESCURO};
+                margin-top: 1em;
+            }
+            .smax-docx-content table { border-collapse: collapse; margin: 10px 0; }
+            .smax-docx-content table td, .smax-docx-content table th {
+                border: 1px solid #bbb;
+                padding: 6px 10px;
+            }
+            .smax-loading {
+                text-align: center;
+                color: #fff;
+                font-size: 15px;
+            }
+            .smax-spinner {
+                width: 48px;
+                height: 48px;
+                border: 5px solid rgba(255,255,255,0.2);
+                border-top-color: ${COR_ACCENT};
+                border-radius: 50%;
+                animation: smaxSpin 0.9s linear infinite;
+                margin: 0 auto 15px;
+            }
+            @keyframes smaxSpin { to { transform: rotate(360deg); } }
+            .smax-erro, .smax-sem-preview {
+                background: #fff;
+                border-radius: 8px;
+                padding: 25px 35px;
+                max-width: 550px;
+                text-align: center;
+                color: #333;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            }
+            .smax-erro { border-top: 4px solid #c62828; }
+            .smax-erro h3 { color: #c62828; margin: 0 0 12px; }
+            .smax-sem-preview { border-top: 4px solid ${COR_ACCENT}; }
+            .smax-sem-preview h3 { color: ${COR_AZUL_ESCURO}; margin: 0 0 12px; }
+            .smax-erro button, .smax-sem-preview button {
+                background: ${COR_AZUL};
+                color: #fff;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                cursor: pointer;
+                font-size: 14px;
+                margin-top: 15px;
+                margin-right: 8px;
+                transition: background 0.15s;
+            }
+            .smax-erro button:hover, .smax-sem-preview button:hover { background: ${COR_AZUL_ESCURO}; }
+
+            /* Ícone flutuante de anexos — atalho pra abrir os anexos sem descer a tela.
+               position:absolute (não fixed) de propósito: rola JUNTO com a página em vez
+               de grudar na tela, pra não sobrepor outros ícones/menus quando o usuário
+               rola pra baixo. Ajuste TOP/LEFT abaixo se não encaixar direito na sua
+               resolução/zoom (calibrado pra ficar perto do cabeçalho "Detalhes"). */
+            #smax-anexos-flutuante {
+                position: absolute;
+                top: 188px;
+                left: 430px;
+                width: 44px;
+                height: 44px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, ${COR_AZUL} 0%, ${COR_AZUL_ESCURO} 100%);
+                color: #fff;
+                border: 2px solid #fff;
+                box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 999997;
+                transition: transform 0.15s, box-shadow 0.15s;
+                padding: 0;
+            }
+            #smax-anexos-flutuante::before {
+                content: '';
+                position: absolute;
+                top: -6px; left: -6px; right: -6px; bottom: -6px;
+                border-radius: 50%;
+                border: 2px solid ${COR_AZUL};
+                opacity: 0.6;
+                animation: smaxAnexosPulso 2.2s ease-out infinite;
+                pointer-events: none;
+            }
+            @keyframes smaxAnexosPulso {
+                0% { transform: scale(0.85); opacity: 0.6; }
+                100% { transform: scale(1.35); opacity: 0; }
+            }
+            #smax-anexos-flutuante svg { width: 20px; height: 20px; position: relative; }
+            #smax-anexos-flutuante:hover { transform: scale(1.08); box-shadow: 0 6px 18px rgba(0,0,0,0.4); }
+            #smax-anexos-badge {
+                position: absolute;
+                top: -5px;
+                right: -5px;
+                background: #fff;
+                color: ${COR_AZUL_ESCURO};
+                font-size: 11px;
+                font-weight: 700;
+                min-width: 18px;
+                height: 18px;
+                border-radius: 999px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0 4px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+            }
+            #smax-anexos-popover {
+                position: absolute;
+                top: 234px;
+                left: 430px;
+                background: #fff;
+                border-radius: 8px;
+                box-shadow: 0 12px 32px rgba(0,0,0,0.4);
+                width: 300px;
+                max-height: 55vh;
+                overflow-y: auto;
+                z-index: 999997;
+                border: 1px solid #d8e3f0;
+                font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+            }
+            #smax-anexos-popover-header {
+                background: ${COR_AZUL};
+                color: #fff;
+                padding: 10px 14px;
+                font-size: 13px;
+                font-weight: 600;
+                border-radius: 8px 8px 0 0;
+                position: sticky;
+                top: 0;
+            }
+            .smax-anexos-item {
+                display: flex;
+                align-items: center;
+                gap: 9px;
+                padding: 10px 14px;
+                cursor: pointer;
+                font-size: 13px;
+                color: #222;
+                border-bottom: 1px solid #eef2f7;
+                transition: background 0.12s;
+            }
+            .smax-anexos-item:last-child { border-bottom: none; }
+            .smax-anexos-item:hover { background: #eaf4fd; }
+            .smax-anexos-item-icone { flex-shrink: 0; font-size: 15px; }
+            .smax-anexos-item-nome {
+                flex: 1;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+
+            /* Ícone flutuante de dados da solicitação (mesmo padrão do de anexos,
+               ao lado dele) */
+            #smax-dados-flutuante {
+                position: absolute;
+                top: 188px;
+                left: 484px;
+                width: 44px;
+                height: 44px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, ${COR_AZUL} 0%, ${COR_AZUL_ESCURO} 100%);
+                color: #fff;
+                border: 2px solid #fff;
+                box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 999997;
+                transition: transform 0.15s, box-shadow 0.15s;
+                padding: 0;
+            }
+            #smax-dados-flutuante svg { width: 20px; height: 20px; }
+            #smax-dados-flutuante:hover { transform: scale(1.08); box-shadow: 0 6px 18px rgba(0,0,0,0.4); }
+            #smax-dados-painel {
+                position: absolute;
+                top: 234px;
+                left: 484px;
+                background: #fff;
+                border-radius: 8px;
+                box-shadow: 0 12px 32px rgba(0,0,0,0.4);
+                width: 300px;
+                z-index: 999997;
+                border: 1px solid #d8e3f0;
+                font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+            }
+            #smax-dados-painel-header {
+                background: ${COR_AZUL};
+                color: #fff;
+                padding: 10px 14px;
+                font-size: 13px;
+                font-weight: 600;
+                border-radius: 8px 8px 0 0;
+            }
+            #smax-dados-painel-corpo { padding: 8px 12px 12px; }
+            .smax-dados-carregando, .smax-dados-vazio {
+                text-align: center;
+                color: #556;
+                font-size: 13px;
+                padding: 16px 6px;
+            }
+            .smax-dados-item {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 8px 2px;
+                border-bottom: 1px solid #eef2f7;
+            }
+            .smax-dados-item:last-of-type { border-bottom: none; }
+            .smax-dados-item-texto { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+            .smax-dados-item-rotulo { font-size: 11px; color: #7a8699; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; }
+            .smax-dados-item-valor {
+                font-size: 13px;
+                color: #222;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .smax-dados-copiar {
+                flex-shrink: 0;
+                background: #eaf4fd;
+                border: 1px solid #cfe4f7;
+                border-radius: 5px;
+                width: 28px;
+                height: 28px;
+                cursor: pointer;
+                font-size: 13px;
+                transition: background 0.12s;
+            }
+            .smax-dados-copiar:hover { background: #d5e9fa; }
+            #smax-dados-copiar-tudo {
+                width: 100%;
+                margin-top: 10px;
+                background: ${COR_AZUL};
+                color: #fff;
+                border: none;
+                padding: 8px;
+                border-radius: 5px;
+                cursor: pointer;
+                font-size: 13px;
+                font-weight: 600;
+                transition: background 0.15s;
+            }
+            #smax-dados-copiar-tudo:hover { background: ${COR_AZUL_ESCURO}; }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ============================================================
+    // DETECÇÃO DE TIPO DE ARQUIVO
+    // ============================================================
+    function detectarTipo(nomeArquivo) {
+        const ext = (nomeArquivo.split('.').pop() || '').toLowerCase();
+        if (ext === 'pdf') return 'pdf';
+        if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'].includes(ext)) return 'imagem';
+        if (ext === 'docx') return 'docx';
+        if (ext === 'doc') return 'doc-legado'; // formato binário antigo, mammoth só lê .docx
+        if (['txt', 'log', 'csv'].includes(ext)) return 'texto';
+        return 'desconhecido';
+    }
+
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    // ============================================================
+    // BUSCA DO ARQUIVO (via $http do Angular quando disponível)
+    // ============================================================
+    function obterHttpAngular() {
+        try {
+            if (typeof angular === 'undefined') return null;
+            const el = document.querySelector('[ng-app]') || document.body;
+            const injector = angular.element(el).injector();
+            if (!injector) return null;
+            return injector.get('$http');
+        } catch (e) {
+            log('Não foi possível obter $http do Angular, vou usar fetch puro:', e);
+            return null;
+        }
+    }
+
+    async function buscarArquivoComoBlob(url) {
+        const http = obterHttpAngular();
+        if (http) {
+            try {
+                const resp = await http.get(url, { responseType: 'blob' });
+                log('Arquivo obtido via $http do Angular (mesmos headers/CSRF do app).');
+                return resp.data;
+            } catch (err) {
+                log('Falha ao buscar via $http do Angular, tentando fetch puro:', err);
+            }
+        }
+        const resp = await fetch(url, { credentials: 'include' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status} - ${resp.statusText}`);
+        return await resp.blob();
+    }
+
+    // ============================================================
+    // ESTADO GLOBAL DO MODAL
+    // ============================================================
+    let blobUrlAtual = null;
+    let pdfDocAtual = null;
+    let pdfPaginaAtual = 1;
+    let pdfZoomAtual = 1.3;
+    let renderTaskAtual = null;
+    let listaAnexosAtual = [];   // [{ nome, url, elemento }]
+    let indiceAnexoAtual = -1;
+
+    // ============================================================
+    // ABERTURA / FECHAMENTO DO MODAL
+    // ============================================================
+    function abrirModal(lista, indice) {
+        fecharModal();
+        listaAnexosAtual = lista;
+        indiceAnexoAtual = indice;
+        injetarEstilos();
+        construirEsqueletoModal();
+        carregarAnexoAtual();
+    }
+
+    function fecharModal() {
+        const overlay = document.getElementById('smax-preview-overlay');
+        if (overlay) overlay.remove();
+        if (blobUrlAtual) {
+            URL.revokeObjectURL(blobUrlAtual);
+            blobUrlAtual = null;
+        }
+        if (renderTaskAtual) {
+            try { renderTaskAtual.cancel(); } catch (e) {}
+            renderTaskAtual = null;
+        }
+        pdfDocAtual = null;
+        pdfPaginaAtual = 1;
+        listaAnexosAtual = [];
+        indiceAnexoAtual = -1;
+        document.removeEventListener('keydown', handlerTeclado);
+    }
+
+    function construirEsqueletoModal() {
+        const overlay = document.createElement('div');
+        overlay.id = 'smax-preview-overlay';
+        overlay.innerHTML = `
+<div id="smax-preview-shell">
+<button id="smax-nav-prev" class="smax-nav-arrow smax-nav-prev" title="Anexo anterior (Alt+&larr;)">&#8249;</button>
+<button id="smax-nav-next" class="smax-nav-arrow smax-nav-next" title="Próximo anexo (Alt+&rarr;)">&#8250;</button>
+<div id="smax-preview-modal">
+<div id="smax-preview-header">
+<span id="smax-preview-title"></span>
+<span id="smax-preview-contador"></span>
+<button class="smax-preview-btn" id="smax-btn-baixar">⬇ Baixar</button>
+<button class="smax-preview-btn" id="smax-btn-nova-guia">🗗 Nova guia</button>
+<button class="smax-preview-btn smax-preview-btn-close" id="smax-btn-fechar">✖ Fechar</button>
+</div>
+<div id="smax-preview-body" class="smax-center-content"></div>
+</div>
+</div>
+        `;
+        document.body.appendChild(overlay);
+
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) fecharModal(); });
+        document.getElementById('smax-btn-fechar').addEventListener('click', fecharModal);
+        document.getElementById('smax-btn-baixar').addEventListener('click', () => {
+            const item = listaAnexosAtual[indiceAnexoAtual];
+            if (!item) return;
+            const link = document.createElement('a');
+            link.href = item.url;
+            link.download = item.nome;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+        });
+        document.getElementById('smax-btn-nova-guia').addEventListener('click', () => {
+            const item = listaAnexosAtual[indiceAnexoAtual];
+            window.open(blobUrlAtual || (item && item.url), '_blank');
+        });
+        document.getElementById('smax-nav-prev').addEventListener('click', () => trocarAnexo(-1));
+        document.getElementById('smax-nav-next').addEventListener('click', () => trocarAnexo(1));
+
+        document.addEventListener('keydown', handlerTeclado);
+    }
+
+    function handlerTeclado(e) {
+        if (e.key === 'Escape') { fecharModal(); return; }
+
+        // Alt+Seta sempre troca de anexo, mesmo dentro de um PDF paginado
+        if (e.altKey && e.key === 'ArrowRight') { trocarAnexo(1); e.preventDefault(); return; }
+        if (e.altKey && e.key === 'ArrowLeft') { trocarAnexo(-1); e.preventDefault(); return; }
+
+        if (pdfDocAtual) {
+            if (e.key === 'ArrowRight' || e.key === 'PageDown') { irParaPagina(pdfPaginaAtual + 1); e.preventDefault(); }
+            if (e.key === 'ArrowLeft' || e.key === 'PageUp') { irParaPagina(pdfPaginaAtual - 1); e.preventDefault(); }
+            return;
+        }
+
+        // Sem paginação (imagem/docx/txt): seta pura já troca de anexo
+        if (e.key === 'ArrowRight') { trocarAnexo(1); e.preventDefault(); }
+        if (e.key === 'ArrowLeft') { trocarAnexo(-1); e.preventDefault(); }
+    }
+
+    // ============================================================
+    // NAVEGAÇÃO ENTRE ANEXOS
+    // ============================================================
+    function trocarAnexo(delta) {
+        if (!listaAnexosAtual.length) return;
+        const novoIndice = indiceAnexoAtual + delta;
+        if (novoIndice < 0 || novoIndice >= listaAnexosAtual.length) return;
+        indiceAnexoAtual = novoIndice;
+        carregarAnexoAtual();
+    }
+
+    function atualizarCabecalho() {
+        const item = listaAnexosAtual[indiceAnexoAtual];
+        if (!item) return;
+        const title = document.getElementById('smax-preview-title');
+        const contador = document.getElementById('smax-preview-contador');
+        if (title) title.textContent = '📄 ' + item.nome;
+        if (contador) {
+            contador.textContent = listaAnexosAtual.length > 1
+                ? `${indiceAnexoAtual + 1} / ${listaAnexosAtual.length}`
+                : '';
+        }
+    }
+
+    function atualizarSetasNavegacao() {
+        const prev = document.getElementById('smax-nav-prev');
+        const next = document.getElementById('smax-nav-next');
+        if (!prev || !next) return;
+        const mostrar = listaAnexosAtual.length > 1;
+        prev.classList.toggle('smax-nav-hidden', !mostrar);
+        next.classList.toggle('smax-nav-hidden', !mostrar);
+        prev.disabled = indiceAnexoAtual <= 0;
+        next.disabled = indiceAnexoAtual >= listaAnexosAtual.length - 1;
+    }
+
+    function carregarAnexoAtual() {
+        const item = listaAnexosAtual[indiceAnexoAtual];
+        if (!item) return;
+
+        // Limpa estado específico do arquivo anterior (mas mantém o modal aberto)
+        const oldToolbar = document.getElementById('smax-pdf-toolbar');
+        if (oldToolbar) oldToolbar.remove();
+        if (renderTaskAtual) { try { renderTaskAtual.cancel(); } catch (e) {} renderTaskAtual = null; }
+        pdfDocAtual = null;
+        pdfPaginaAtual = 1;
+        if (blobUrlAtual) { URL.revokeObjectURL(blobUrlAtual); blobUrlAtual = null; }
+
+        const body = document.getElementById('smax-preview-body');
+        body.classList.add('smax-center-content');
+        body.innerHTML = `
+            <div class="smax-loading">
+                <div class="smax-spinner"></div>
+                <div>Carregando <b>${escapeHtml(item.nome)}</b>...</div>
+            </div>
+        `;
+
+        atualizarCabecalho();
+        atualizarSetasNavegacao();
+
+        carregarERenderizar(item.nome, item.url);
+    }
+
+    async function carregarERenderizar(nomeArquivo, url) {
+        const body = document.getElementById('smax-preview-body');
+        const tipo = detectarTipo(nomeArquivo);
+        log('Carregando:', nomeArquivo, '| tipo:', tipo, '| URL:', url);
+
+        try {
+            const blob = await buscarArquivoComoBlob(url);
+            log('Blob recebido:', blob.type, blob.size, 'bytes');
+
+            if (blob.type === 'text/html' || blob.type === 'application/json') {
+                throw new Error(`O servidor devolveu "${blob.type}" em vez do arquivo — provável sessão expirada ou sem permissão. Recarregue a página (F5) e tente de novo.`);
+            }
+
+            if (tipo === 'pdf') {
+                await renderizarPdf(blob, url);
+            } else if (tipo === 'imagem') {
+                const ext = nomeArquivo.split('.').pop().toLowerCase();
+                const mime = blob.type.startsWith('image/') ? blob.type : (ext === 'jpg' ? 'image/jpeg' : `image/${ext}`);
+                const blobTipado = new Blob([blob], { type: mime });
+                // usado pelos botões "Baixar" / "Nova guia" (navegação de aba, não sofre com img-src)
+                blobUrlAtual = URL.createObjectURL(blobTipado);
+                await renderizarImagem(blobTipado, nomeArquivo);
+            } else if (tipo === 'docx') {
+                await renderizarDocx(blob, body);
+            } else if (tipo === 'doc-legado') {
+                mostrarDocLegado(nomeArquivo);
+            } else if (tipo === 'texto') {
+                const texto = await blob.text();
+                body.classList.remove('smax-center-content');
+                body.innerHTML = '';
+                const pre = document.createElement('pre');
+                pre.className = 'smax-docx-content';
+                pre.style.whiteSpace = 'pre-wrap';
+                pre.style.fontFamily = 'Consolas, Monaco, monospace';
+                pre.style.fontSize = '13px';
+                pre.textContent = texto;
+                body.appendChild(pre);
+            } else {
+                mostrarSemPreview(nomeArquivo);
+            }
+        } catch (err) {
+            console.error(LOG_PREFIX, 'Erro ao carregar arquivo:', err);
+            mostrarErro(err.message, url, nomeArquivo);
+        }
+    }
+
+    // ============================================================
+    // RENDERIZAÇÃO DE IMAGEM (via createImageBitmap + canvas)
+    // ============================================================
+    async function renderizarImagem(blobTipado, nomeArquivo) {
+        const body = document.getElementById('smax-preview-body');
+        body.classList.add('smax-center-content');
+        try {
+            // Decodifica o Blob inteiramente em memória — não passa por img-src/CSP
+            const bitmap = await createImageBitmap(blobTipado);
+            body.innerHTML = '';
+            const canvas = document.createElement('canvas');
+            canvas.className = 'smax-img-canvas';
+            canvas.width = bitmap.width;
+            canvas.height = bitmap.height;
+            canvas.getContext('2d').drawImage(bitmap, 0, 0);
+            bitmap.close();
+            body.appendChild(canvas);
+        } catch (err) {
+            log('createImageBitmap falhou, caindo para <img src="blob:...">:', err);
+            body.innerHTML = '';
+            const img = document.createElement('img');
+            img.alt = nomeArquivo;
+            img.src = blobUrlAtual;
+            body.appendChild(img);
+        }
+    }
+
+    // ============================================================
+    // RENDERIZAÇÃO PDF (via PDF.js)
+    // ============================================================
+    async function renderizarPdf(blob, urlOriginal) {
+        const body = document.getElementById('smax-preview-body');
+
+        if (typeof pdfjsLib === 'undefined') {
+            log('PDF.js indisponível, usando fallback iframe.');
+            return fallbackIframePdf(blob);
+        }
+
+        try {
+            const arrayBuffer = await blob.arrayBuffer();
+            const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+            pdfDocAtual = await loadingTask.promise;
+            log('PDF carregado. Páginas:', pdfDocAtual.numPages);
+
+            const modal = document.getElementById('smax-preview-modal');
+            const oldToolbar = document.getElementById('smax-pdf-toolbar');
+            if (oldToolbar) oldToolbar.remove();
+
+            const toolbar = document.createElement('div');
+            toolbar.id = 'smax-pdf-toolbar';
+            toolbar.innerHTML = `
+<button id="smax-pdf-prev" title="Página anterior (←)">◀</button>
+<span>Pág.</span>
+<input type="number" id="smax-pdf-page-input" min="1" max="${pdfDocAtual.numPages}" value="1">
+<span>/ ${pdfDocAtual.numPages}</span>
+<button id="smax-pdf-next" title="Próxima página (→)">▶</button>
+<span class="smax-sep"></span>
+<button id="smax-pdf-zoom-out" title="Diminuir zoom">−</button>
+<span id="smax-pdf-zoom-label">${Math.round(pdfZoomAtual * 100)}%</span>
+<button id="smax-pdf-zoom-in" title="Aumentar zoom">+</button>
+<button id="smax-pdf-zoom-fit" title="Ajustar à largura">↔ Ajustar</button>
+            `;
+            modal.insertBefore(toolbar, body);
+
+            body.classList.remove('smax-center-content');
+            body.innerHTML = '<div id="smax-pdf-container"></div>';
+
+            document.getElementById('smax-pdf-prev').addEventListener('click', () => irParaPagina(pdfPaginaAtual - 1));
+            document.getElementById('smax-pdf-next').addEventListener('click', () => irParaPagina(pdfPaginaAtual + 1));
+            document.getElementById('smax-pdf-page-input').addEventListener('change', (e) => {
+                irParaPagina(parseInt(e.target.value, 10) || 1);
+            });
+            document.getElementById('smax-pdf-zoom-in').addEventListener('click', () => alterarZoom(pdfZoomAtual + 0.2));
+            document.getElementById('smax-pdf-zoom-out').addEventListener('click', () => alterarZoom(pdfZoomAtual - 0.2));
+            document.getElementById('smax-pdf-zoom-fit').addEventListener('click', () => ajustarZoomLargura());
+
+            pdfPaginaAtual = 1;
+            await renderizarPaginaPdf(1);
+        } catch (err) {
+            console.error(LOG_PREFIX, 'Erro no PDF.js:', err);
+            log('Tentando fallback iframe...');
+            fallbackIframePdf(blob);
+        }
+    }
+
+    async function renderizarPaginaPdf(numPagina) {
+        if (!pdfDocAtual) return;
+        if (numPagina < 1 || numPagina > pdfDocAtual.numPages) return;
+        pdfPaginaAtual = numPagina;
+
+        const container = document.getElementById('smax-pdf-container');
+        if (!container) return;
+
+        try {
+            if (renderTaskAtual) { try { renderTaskAtual.cancel(); } catch(e){} }
+            const page = await pdfDocAtual.getPage(numPagina);
+            const viewport = page.getViewport({ scale: pdfZoomAtual });
+
+            container.innerHTML = '';
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            container.appendChild(canvas);
+
+            renderTaskAtual = page.render({ canvasContext: ctx, viewport });
+            await renderTaskAtual.promise;
+            renderTaskAtual = null;
+
+            const input = document.getElementById('smax-pdf-page-input');
+            if (input) input.value = numPagina;
+            const btnPrev = document.getElementById('smax-pdf-prev');
+            const btnNext = document.getElementById('smax-pdf-next');
+            if (btnPrev) btnPrev.disabled = numPagina <= 1;
+            if (btnNext) btnNext.disabled = numPagina >= pdfDocAtual.numPages;
+        } catch (err) {
+            if (err && err.name === 'RenderingCancelledException') return;
+            console.error(LOG_PREFIX, 'Erro ao renderizar página:', err);
+        }
+    }
+
+    function irParaPagina(n) {
+        if (!pdfDocAtual) return;
+        n = Math.max(1, Math.min(pdfDocAtual.numPages, n));
+        renderizarPaginaPdf(n);
+    }
+
+    function alterarZoom(novoZoom) {
+        pdfZoomAtual = Math.max(0.4, Math.min(4, novoZoom));
+        const label = document.getElementById('smax-pdf-zoom-label');
+        if (label) label.textContent = Math.round(pdfZoomAtual * 100) + '%';
+        renderizarPaginaPdf(pdfPaginaAtual);
+    }
+
+    async function ajustarZoomLargura() {
+        if (!pdfDocAtual) return;
+        const page = await pdfDocAtual.getPage(pdfPaginaAtual);
+        const viewport = page.getViewport({ scale: 1 });
+        const container = document.getElementById('smax-pdf-container');
+        const larguraDisp = container.clientWidth - 30;
+        alterarZoom(larguraDisp / viewport.width);
+    }
+
+    function fallbackIframePdf(blob) {
+        const body = document.getElementById('smax-preview-body');
+        const blobPdf = blob.type === 'application/pdf' ? blob : new Blob([blob], { type: 'application/pdf' });
+        blobUrlAtual = URL.createObjectURL(blobPdf);
+        body.classList.remove('smax-center-content');
+        body.innerHTML = '';
+        const iframe = document.createElement('iframe');
+        iframe.src = blobUrlAtual;
+        body.appendChild(iframe);
+    }
+
+    // ============================================================
+    // DOCX
+    // ============================================================
+    async function renderizarDocx(blob, body) {
+        if (typeof mammoth === 'undefined') {
+            mostrarErro('Biblioteca mammoth.js não foi carregada. Verifique o @require no cabeçalho.');
+            return;
+        }
+        const arrayBuffer = await blob.arrayBuffer();
+        const resultado = await mammoth.convertToHtml({ arrayBuffer });
+        body.classList.remove('smax-center-content');
+        body.innerHTML = '';
+        const wrap = document.createElement('div');
+        wrap.className = 'smax-docx-wrap';
+        wrap.innerHTML = `
+<p class="smax-docx-aviso">ℹ️ Pré-visualização simplificada — a formatação pode diferir um pouco do arquivo original. Use "Baixar" para ver com fidelidade total no Word.</p>
+        `;
+        const div = document.createElement('div');
+        div.className = 'smax-docx-content';
+        div.innerHTML = resultado.value || '<p><i>Documento vazio ou sem conteúdo renderizável.</i></p>';
+        wrap.appendChild(div);
+        body.appendChild(wrap);
+    }
+
+    // ============================================================
+    // ERROS E SEM PREVIEW
+    // ============================================================
+    function mostrarErro(mensagem, url, nomeArquivo) {
+        const body = document.getElementById('smax-preview-body');
+        if (!body) return;
+        body.classList.add('smax-center-content');
+        body.innerHTML = `
+<div class="smax-erro">
+<h3>⚠️ Não foi possível carregar o anexo</h3>
+<p>${escapeHtml(mensagem || '')}</p>
+<p style="font-size:12px;color:#666;">Você ainda pode tentar abrir o arquivo pelos botões abaixo.</p>
+<button id="smax-erro-baixar">⬇ Baixar</button>
+<button id="smax-erro-nova-guia">🔍 Nova guia</button>
+</div>
+        `;
+        document.getElementById('smax-erro-baixar').addEventListener('click', () => document.getElementById('smax-btn-baixar').click());
+        document.getElementById('smax-erro-nova-guia').addEventListener('click', () => document.getElementById('smax-btn-nova-guia').click());
+    }
+
+    function mostrarSemPreview(nomeArquivo) {
+        const body = document.getElementById('smax-preview-body');
+        if (!body) return;
+        body.classList.add('smax-center-content');
+        body.innerHTML = `
+<div class="smax-sem-preview">
+<h3>📎 Pré-visualização não disponível</h3>
+<p>O arquivo <b>${escapeHtml(nomeArquivo)}</b> não tem visualizador integrado neste script.</p>
+<p style="font-size:13px;color:#666;">Tipos suportados: PDF, imagens (PNG/JPG/GIF/WEBP), DOCX e TXT.</p>
+<button id="smax-btn-baixar-fallback">⬇ Baixar arquivo</button>
+</div>
+        `;
+        document.getElementById('smax-btn-baixar-fallback').addEventListener('click', () => document.getElementById('smax-btn-baixar').click());
+    }
+
+    function mostrarDocLegado(nomeArquivo) {
+        const body = document.getElementById('smax-preview-body');
+        if (!body) return;
+        body.classList.add('smax-center-content');
+        body.innerHTML = `
+<div class="smax-sem-preview">
+<h3>📄 Formato .doc antigo</h3>
+<p><b>${escapeHtml(nomeArquivo)}</b> está no formato binário antigo do Word (.doc), que este visualizador não consegue interpretar — só arquivos .docx modernos.</p>
+<p style="font-size:13px;color:#666;">Baixe o arquivo e abra no Word para visualizar.</p>
+<button id="smax-btn-baixar-doclegado">⬇ Baixar arquivo</button>
+</div>
+        `;
+        document.getElementById('smax-btn-baixar-doclegado').addEventListener('click', () => document.getElementById('smax-btn-baixar').click());
+    }
+
+    // ============================================================
+    // COLETA DE ANEXOS DA TELA + INTERCEPTAÇÃO DE CLIQUES
+    // ============================================================
+    function estaEmTelaDeChamado() {
+        return REGEX_TELA_CHAMADO.test(location.href);
+    }
+
+    function coletarAnexosDaTela() {
+        const links = Array.from(document.querySelectorAll(SELETOR_ANEXO));
+        return links.map(link => {
+            // link.href (propriedade, não getAttribute) já vem resolvida pelo próprio
+            // navegador, respeitando o contexto real do documento (iframe, <base>, etc.).
+            // Calcular isso na mão com new URL(href, location.href) dava uma URL errada
+            // aqui, porque a tela roda dentro de um iframe com base diferente da página
+            // externa — por isso o fetch/$http sempre recebia uma página de erro.
+            if (!link.href) return null;
+            return {
+                nome: (link.textContent || 'anexo').trim(),
+                url: link.href,
+                elemento: link
+            };
+        }).filter(Boolean);
+    }
+
+    function interceptarClique(e) {
+        if (!estaEmTelaDeChamado()) return;
+        const link = e.target.closest(SELETOR_ANEXO);
+        if (!link) return;
+        if (e.ctrlKey || e.metaKey || e.shiftKey) return; // permite ctrl+clique manual
+
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+
+        const lista = coletarAnexosDaTela();
+        let indice = lista.findIndex(a => a.elemento === link);
+
+        if (indice === -1) {
+            // Fallback: não achou na varredura da tela, monta um item avulso
+            const url = link.href;
+            const nome = (link.textContent || 'anexo').trim();
+            log('Anexo não encontrado na varredura, abrindo avulso:', nome, '→', url);
+            abrirModal([{ nome, url, elemento: link }], 0);
+            return;
+        }
+
+        log(`Anexo interceptado: ${lista[indice].nome} (${indice + 1}/${lista.length}) → ${lista[indice].url}`);
+        abrirModal(lista, indice);
+    }
+
+    document.addEventListener('click', interceptarClique, true);
+
+    // ============================================================
+    // ÍCONE FLUTUANTE DE ANEXOS (atalho, sem precisar descer a tela)
+    // ============================================================
+    let botaoAnexosEl = null;
+    let popoverAnexosEl = null;
+
+    // Âncora dinâmica pros ícones flutuantes: em vez de uma posição fixa em pixels
+    // (que quebra quando algo — como o painel de "Consulta rápida" — empurra o
+    // conteúdo do chamado pra baixo), calculamos a posição com base num elemento
+    // real da tela do chamado, recalculado a cada atualização.
+    function calcularAncoraIcones() {
+        // O cabeçalho da seção "Detalhes" — pl-entity-page-component-header-text é
+        // usado por vários cabeçalhos de seção na tela, então filtramos pelo texto
+        // "Detalhes" especificamente (com fallback pro primeiro achado, caso o texto
+        // mude por algum motivo).
+        const cabecalhos = Array.from(document.querySelectorAll('.pl-entity-page-component-header-text'));
+        const ancora = cabecalhos.find(el => el.textContent.trim().startsWith('Detalhes')) || cabecalhos[0];
+        if (!ancora) return null;
+        const rect = ancora.getBoundingClientRect();
+        // Se a seção estiver escondida (ex: modo minimizado ao rolar), o navegador
+        // reporta tudo como zero — ignoramos a âncora nesse caso e mantemos a última
+        // posição válida, em vez de recalcular pra um valor errado.
+        if (rect.width === 0 && rect.height === 0) return null;
+        return { top: rect.top + window.scrollY, left: rect.left + window.scrollX, width: rect.width, height: rect.height };
+    }
+
+    function posicionarIconesFlutuantes() {
+        const ancora = calcularAncoraIcones();
+        if (!ancora) return; // sem âncora válida agora, mantém a última posição conhecida
+
+        // Posiciona ao lado direito do texto "Detalhes", centralizado na mesma altura.
+        const topBotoes = Math.max(ancora.top + (ancora.height / 2) - 22, 8) + 'px';
+        const topPaineis = (ancora.top + ancora.height + 20) + 'px';
+        const leftAnexos = (ancora.left + ancora.width + 16) + 'px';
+        const leftDados = (ancora.left + ancora.width + 70) + 'px';
+
+        if (botaoAnexosEl) { botaoAnexosEl.style.top = topBotoes; botaoAnexosEl.style.left = leftAnexos; }
+        if (botaoDadosEl) { botaoDadosEl.style.top = topBotoes; botaoDadosEl.style.left = leftDados; }
+        if (popoverAnexosEl) { popoverAnexosEl.style.top = topPaineis; popoverAnexosEl.style.left = leftAnexos; }
+        if (painelDadosEl) { painelDadosEl.style.top = topPaineis; painelDadosEl.style.left = leftDados; }
+    }
+
+    function atualizarBotaoFlutuante() {
+        const emTela = estaEmTelaDeChamado();
+        const lista = emTela ? coletarAnexosDaTela() : [];
+
+        if (!emTela || lista.length === 0) {
+            if (botaoAnexosEl) { botaoAnexosEl.remove(); botaoAnexosEl = null; }
+            fecharPopoverAnexos();
+            return;
+        }
+
+        if (!botaoAnexosEl) {
+            injetarEstilos();
+            botaoAnexosEl = document.createElement('button');
+            botaoAnexosEl.id = 'smax-anexos-flutuante';
+            botaoAnexosEl.title = 'Anexos desta solicitação';
+            botaoAnexosEl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg><span id="smax-anexos-badge"></span>';
+            botaoAnexosEl.addEventListener('click', (e) => {
+                e.stopPropagation();
+                alternarPopoverAnexos();
+            });
+            document.body.appendChild(botaoAnexosEl);
+        }
+
+        const badge = document.getElementById('smax-anexos-badge');
+        if (badge) badge.textContent = String(lista.length);
+        posicionarIconesFlutuantes();
+    }
+
+    function alternarPopoverAnexos() {
+        if (popoverAnexosEl) {
+            fecharPopoverAnexos();
+        } else {
+            abrirPopoverAnexos();
+        }
+    }
+
+    function abrirPopoverAnexos() {
+        const lista = coletarAnexosDaTela();
+        if (!lista.length) return;
+
+        popoverAnexosEl = document.createElement('div');
+        popoverAnexosEl.id = 'smax-anexos-popover';
+
+        const header = document.createElement('div');
+        header.id = 'smax-anexos-popover-header';
+        header.textContent = `📎 Anexos (${lista.length})`;
+        popoverAnexosEl.appendChild(header);
+
+        lista.forEach((item, idx) => {
+            const tipo = detectarTipo(item.nome);
+            const icone = tipo === 'pdf' ? '📕' : tipo === 'imagem' ? '🖼️' : (tipo === 'docx' || tipo === 'doc-legado') ? '📝' : '📎';
+            const linha = document.createElement('div');
+            linha.className = 'smax-anexos-item';
+            linha.innerHTML = `<span class="smax-anexos-item-icone">${icone}</span><span class="smax-anexos-item-nome">${escapeHtml(item.nome)}</span>`;
+            linha.addEventListener('click', (e) => {
+                e.stopPropagation();
+                fecharPopoverAnexos();
+                abrirModal(lista, idx);
+            });
+            popoverAnexosEl.appendChild(linha);
+        });
+
+        document.body.appendChild(popoverAnexosEl);
+        posicionarIconesFlutuantes();
+        setTimeout(() => document.addEventListener('click', handlerFecharPopoverAoClicarFora, true), 0);
+    }
+
+    function fecharPopoverAnexos() {
+        if (popoverAnexosEl) { popoverAnexosEl.remove(); popoverAnexosEl = null; }
+        document.removeEventListener('click', handlerFecharPopoverAoClicarFora, true);
+    }
+
+    function handlerFecharPopoverAoClicarFora(e) {
+        if (popoverAnexosEl && !popoverAnexosEl.contains(e.target) && e.target !== botaoAnexosEl) {
+            fecharPopoverAnexos();
+        }
+    }
+
+    // ============================================================
+    // ÍCONE FLUTUANTE DE DADOS DA SOLICITAÇÃO (solicitante + processo)
+    // ============================================================
+    let botaoDadosEl = null;
+    let painelDadosEl = null;
+
+    // Cache por chamado: busca uma vez em segundo plano (assim que a tela abre) e
+    // reaproveita o resultado sempre que o painel for aberto de novo, sem repetir a
+    // simulação de hover a cada clique. Só busca de novo se o chamado mudar.
+    let dadosSolicitacaoCache = null;
+    let promessaDadosSolicitacao = null;
+    let urlCacheAtual = null;
+    let tentativasAutomaticas = 0;
+    const MAX_TENTATIVAS_AUTOMATICAS = 2; // evita ficar tentando sozinho pra sempre em segundo plano
+
+    // forcar=true (usado quando o usuário clica no ícone) sempre tenta buscar de novo
+    // se ainda não tiver um resultado válido guardado — mesmo que as tentativas
+    // automáticas em segundo plano já tenham desistido antes.
+    function garantirDadosSolicitacaoCache(forcar) {
+        if (location.href !== urlCacheAtual) {
+            urlCacheAtual = location.href;
+            dadosSolicitacaoCache = null;
+            promessaDadosSolicitacao = null;
+            tentativasAutomaticas = 0;
+        }
+        if (dadosSolicitacaoCache && dadosSolicitacaoCache.pessoa) return Promise.resolve(dadosSolicitacaoCache);
+        if (promessaDadosSolicitacao) return promessaDadosSolicitacao;
+        if (!forcar && tentativasAutomaticas >= MAX_TENTATIVAS_AUTOMATICAS) {
+            return Promise.resolve(dadosSolicitacaoCache || { pessoa: null, processo: extrairNumeroProcesso() });
+        }
+        tentativasAutomaticas++;
+
+        promessaDadosSolicitacao = (async () => {
+            const { pessoa, processoCampo } = await obterDadosSolicitante();
+            const processo = processoCampo || extrairNumeroProcesso();
+            const resultado = { pessoa, processo };
+            if (pessoa) dadosSolicitacaoCache = resultado; // só fixa no cache se deu certo — permite tentar de novo se falhou
+            promessaDadosSolicitacao = null;
+            return resultado;
+        })();
+        return promessaDadosSolicitacao;
+    }
+
+    function atualizarBotaoDados() {
+        const emTela = estaEmTelaDeChamado();
+        // Só mostra depois que o formulário do chamado realmente renderizou (mesma
+        // checagem usada pra posicionar os ícones) — evita o botão "piscar" antes da
+        // página do chamado terminar de carregar, igual já acontecia com o de anexos
+        // (que só aparece quando acha um anexo de verdade na tela).
+        const formularioRenderizado = emTela && !!document.querySelector('.pl-entity-page-component-header-text');
+
+        if (!formularioRenderizado) {
+            if (botaoDadosEl) { botaoDadosEl.remove(); botaoDadosEl = null; }
+            fecharPainelDados();
+            return;
+        }
+
+        if (!botaoDadosEl) {
+            injetarEstilos();
+            botaoDadosEl = document.createElement('button');
+            botaoDadosEl.id = 'smax-dados-flutuante';
+            botaoDadosEl.title = 'Dados da solicitação (solicitante + processo)';
+            botaoDadosEl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>';
+            botaoDadosEl.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (painelDadosEl) { fecharPainelDados(); } else { abrirPainelDados(); }
+            });
+            document.body.appendChild(botaoDadosEl);
+        }
+
+        // Dispara a busca em segundo plano assim que a tela do chamado é detectada,
+        // pra já estar pronta (ou quase) quando o usuário clicar no ícone. Mas NÃO
+        // faz isso na aba Discussões: essa busca automática simula clique em
+        // "Mostrar mais" e hover no campo "Solicitado para" (elementos da aba Geral,
+        // que continuam no DOM mesmo escondidos, já que o SPA não desmonta a tela ao
+        // trocar de aba) — mexer nisso em segundo plano bem na hora em que o usuário
+        // está compondo uma resposta em Discussões arriscava efeitos colaterais no
+        // mesmo escopo Angular. Clique manual no ícone continua funcionando em
+        // qualquer aba (força a busca via garantirDadosSolicitacaoCache(true)).
+        if (location.href.toLowerCase().indexOf('/discussions') < 0) {
+            garantirDadosSolicitacaoCache();
+        }
+        posicionarIconesFlutuantes();
+    }
+
+    async function abrirPainelDados() {
+        painelDadosEl = document.createElement('div');
+        painelDadosEl.id = 'smax-dados-painel';
+        painelDadosEl.innerHTML = `
+<div id="smax-dados-painel-header">📋 Dados da solicitação</div>
+<div id="smax-dados-painel-corpo">
+<div class="smax-dados-carregando">Carregando dados do solicitante...</div>
+</div>
+        `;
+        document.body.appendChild(painelDadosEl);
+        posicionarIconesFlutuantes();
+        setTimeout(() => document.addEventListener('click', handlerFecharPainelDadosAoClicarFora, true), 0);
+
+        const dados = await garantirDadosSolicitacaoCache(true);
+        renderizarPainelDados(dados.pessoa, dados.processo);
+    }
+
+    function fecharPainelDados() {
+        if (painelDadosEl) { painelDadosEl.remove(); painelDadosEl = null; }
+        document.removeEventListener('click', handlerFecharPainelDadosAoClicarFora, true);
+    }
+
+    function handlerFecharPainelDadosAoClicarFora(e) {
+        if (painelDadosEl && !painelDadosEl.contains(e.target) && e.target !== botaoDadosEl) {
+            fecharPainelDados();
+        }
+    }
+
+    // Nome/matrícula/unidade só existem no card que aparece ao passar o mouse sobre
+    // o campo "Solicitado para" — então simulamos esse hover (o mesmo evento que o
+    // Angular já escuta) em vez de reimplementar a busca desses dados.
+    function clicarSemNavegar(link) {
+        // dispatchEvent gera um clique "não confiável" — dispara o ng-click do Angular
+        // normalmente, mas o navegador não segue o href="" (isso só acontece com um
+        // clique de verdade do usuário ou com link.click()). Assim evitamos recarregar
+        // a página só pra expandir/recolher o "Mostrar mais".
+        link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    }
+
+    async function obterDadosSolicitante() {
+        let inputCampo = document.querySelector('input[name="RequestedForPerson"]');
+        let expandiuMostrarMais = false;
+
+        if (!inputCampo) {
+            // Campo pode estar escondido atrás de "Mostrar mais" (ng-if remove o campo
+            // do DOM inteiramente quando a seção está recolhida) — expande pra achar.
+            // O campo "Número do processo" às vezes mora na mesma seção, então
+            // aproveitamos essa mesma expansão pra ler os dois antes de recolher.
+            const botaoMostrarMais = document.querySelector('a[data-aid="show-more"]');
+            if (botaoMostrarMais) {
+                clicarSemNavegar(botaoMostrarMais);
+                expandiuMostrarMais = true;
+                await new Promise(r => setTimeout(r, 350));
+                inputCampo = document.querySelector('input[name="RequestedForPerson"]');
+            }
+        }
+
+        // Lê o campo dedicado "Número do processo" (se existir e estiver preenchido)
+        // antes de recolher o "Mostrar mais" de novo.
+        const valorCampoProcesso = document.querySelector('input[name="NumerodoProcesso_c"]')?.value?.trim() || '';
+        const processoCampo = valorCampoProcesso ? (valorCampoProcesso.match(REGEX_PROCESSO)?.[0] || valorCampoProcesso) : null;
+
+        const wrapper = inputCampo ? inputCampo.closest('.entity-picker-input-wrapper') : null;
+        let pessoa = null;
+
+        if (wrapper) {
+            // O ng-mouseenter/ng-mouseleave aqui são tratados internamente como
+            // mouseover/mouseout (com relatedTarget) — disparar "mouseenter"/"mouseleave"
+            // de verdade não aciona o handler. Confirmado testando ao vivo.
+            const rect = wrapper.getBoundingClientRect();
+            const centroX = rect.left + rect.width / 2;
+            const centroY = rect.top + rect.height / 2;
+
+            wrapper.dispatchEvent(new MouseEvent('mouseover', {
+                bubbles: true, cancelable: true, clientX: centroX, clientY: centroY,
+                relatedTarget: document.body, view: window
+            }));
+
+            // Assim que o card do Angular aparecer, escondemos visualmente na hora
+            // (opacity:0 não impede a leitura do texto via JS) — evita o "flash" dele
+            // na tela durante a busca em segundo plano.
+            let popoverEscondido = null;
+            for (let tentativa = 0; tentativa < 24; tentativa++) {
+                await new Promise(r => setTimeout(r, 50));
+                const candidato = Array.from(document.querySelectorAll('.popover')).find(p => {
+                    const estilo = getComputedStyle(p);
+                    return estilo.visibility !== 'hidden' && estilo.display !== 'none';
+                });
+                if (candidato) {
+                    popoverEscondido = candidato;
+                    candidato.style.setProperty('opacity', '0', 'important');
+                    candidato.style.setProperty('pointer-events', 'none', 'important');
+                    break;
+                }
+            }
+            // dá mais um tempinho pro conteúdo interno (nome/matrícula/etc) terminar de carregar
+            await new Promise(r => setTimeout(r, 500));
+
+            const nome = popoverEscondido?.querySelector('.employee-name a')?.textContent.trim() || '';
+            const matricula = popoverEscondido?.querySelector('.employee-number')?.textContent.trim() || '';
+            const unidade = popoverEscondido?.querySelector('[data-aid="location"]')?.textContent.trim() || '';
+
+            wrapper.dispatchEvent(new MouseEvent('mouseout', {
+                bubbles: true, cancelable: true, clientX: centroX, clientY: centroY,
+                relatedTarget: document.body, view: window
+            }));
+
+            if (popoverEscondido) {
+                popoverEscondido.style.removeProperty('opacity');
+                popoverEscondido.style.removeProperty('pointer-events');
+            }
+
+            if (nome || matricula || unidade) pessoa = { nome, matricula, unidade };
+        }
+
+        // Se abrimos "Mostrar mais" só pra conseguir o dado, recolhe de volta — deixa
+        // a tela exatamente como o usuário a encontrou.
+        if (expandiuMostrarMais) {
+            const botaoAgora = document.querySelector('a[data-aid="show-more"]');
+            if (botaoAgora) clicarSemNavegar(botaoAgora);
+        }
+
+        return { pessoa, processoCampo };
+    }
+
+    function extrairNumeroProcesso() {
+        const texto = document.body.innerText || '';
+        const match = texto.match(REGEX_PROCESSO);
+        return match ? match[0] : null;
+    }
+
+    function renderizarPainelDados(dadosPessoa, processo) {
+        const corpo = document.getElementById('smax-dados-painel-corpo');
+        if (!corpo) return;
+
+        if (!dadosPessoa) {
+            corpo.innerHTML = '<div class="smax-dados-vazio">Não consegui localizar os dados do solicitante nesta tela.</div>';
+            return;
+        }
+
+        const linhas = [
+            { rotulo: 'Solicitante', valor: dadosPessoa.nome || '—' },
+            { rotulo: 'Matrícula', valor: dadosPessoa.matricula || '—' },
+            { rotulo: 'Unidade', valor: dadosPessoa.unidade || '—' },
+            { rotulo: 'Processo', valor: processo || 'não encontrado no texto' }
+        ];
+
+        corpo.innerHTML = linhas.map((l, i) => `
+<div class="smax-dados-item">
+<div class="smax-dados-item-texto">
+<span class="smax-dados-item-rotulo">${escapeHtml(l.rotulo)}</span>
+<span class="smax-dados-item-valor" title="${escapeHtml(l.valor)}">${escapeHtml(l.valor)}</span>
+</div>
+<button class="smax-dados-copiar" data-idx="${i}" title="Copiar">📋</button>
+</div>
+        `).join('') + '<button id="smax-dados-copiar-tudo">Copiar tudo</button>';
+
+        linhas.forEach((l, i) => {
+            const btn = corpo.querySelector(`.smax-dados-copiar[data-idx="${i}"]`);
+            if (btn) btn.addEventListener('click', () => copiarTexto(l.valor, btn));
+        });
+
+        const btnTudo = document.getElementById('smax-dados-copiar-tudo');
+        const resumo = linhas.map(l => `${l.rotulo}: ${l.valor}`).join('\n');
+        if (btnTudo) btnTudo.addEventListener('click', () => copiarTexto(resumo, btnTudo));
+    }
+
+    function copiarTexto(texto, botao) {
+        navigator.clipboard.writeText(texto).then(() => {
+            const original = botao.textContent;
+            botao.textContent = '✓';
+            setTimeout(() => { botao.textContent = original; }, 1200);
+        }).catch(err => log('Falha ao copiar para a área de transferência:', err));
+    }
+
+    // A tela é uma SPA Angular — o conteúdo troca sem recarregar a página, então
+    // "load"/"DOMContentLoaded" não bastam pra saber quando um novo chamado abriu.
+    // Observamos mudanças no DOM (com debounce) pra reavaliar os botões flutuantes.
+    let debounceBotaoFlutuante = null;
+    const observadorPagina = new MutationObserver(() => {
+        clearTimeout(debounceBotaoFlutuante);
+        debounceBotaoFlutuante = setTimeout(() => {
+            atualizarBotaoFlutuante();
+            atualizarBotaoDados();
+        }, 400);
+    });
+    observadorPagina.observe(document.body, { childList: true, subtree: true });
+    atualizarBotaoFlutuante();
+    atualizarBotaoDados();
+
+    log('✅ Script de visualização de anexos ativo. Versão 0.20');
+    log('   Busca de arquivo via $http do Angular (fallback: fetch). Imagens via createImageBitmap+canvas.');
+    log('   PDF via PDF.js com worker pré-carregado por @require (sem depender de rede em tempo de execução).');
+    log('   Navegação entre anexos: setas laterais no modal ou Alt+←/Alt+→');
+    log('   Ícone flutuante de anexos (📎) ativo no canto superior esquerdo, quando há anexos no chamado.');
+})();
